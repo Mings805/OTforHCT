@@ -1196,88 +1196,139 @@ def select_lambda_grid_om(
     return lambda_star, mu0_model, losses
 
 
-def ot_lambda_grid_rd(
-    rct,
-    ec,
-    rct_outcome_col: str = "Y_alt",
-    ec_outcome_col: str = "Y",
-    treat_col: str = "A",
-    covariate_cols=("X1", "X2", "X3"),
-    eps: float = 0.1,
-    clip_ratio: float = 10.0,
-    lambda_grid=None,
-    om_degree2: bool = True,
-    om_l2: float = 1e-4,
-):
-    """
-    OT-based RD estimator with lambda chosen by outcome-model calibrated
-    grid search.
+# ======== Outcome-model-based target for tau (logistic OM) ========
 
-    Steps:
-      1) Compute semi-relaxed OT weights w on EC vs full RCT covariates.
-      2) Form EC control mean muE = sum w_i Y_i^EC.
-      3) Compute RCT treated mean muT and RCT control mean muC.
-      4) Fit a logistic outcome model for Y | A=0, X on RCT controls only,
-         get mu0_model = mean predicted Y(0) in the RCT population.
-      5) Choose lambda in lambda_grid minimizing
-            ((1-lambda)*muC + lambda*muE - mu0_model)^2.
-      6) Plug-in lambda into the hybrid estimator:
-            tau = muT - [(1-lambda)*muC + lambda*muE].
+def tau_from_om_logistic(rct,
+                         x_cols=("X1", "X2", "X3"),
+                         outcome_col: str = "Y_alt",
+                         treat_col: str = "A",
+                         degree2: bool = False,
+                         l2: float = 1e-4):
     """
+    Plug-in outcome-model estimate of tau using logistic regression.
+
+    Fits separate logistic models for controls (A=0) and treated (A=1),
+    then averages the difference in predicted probabilities over the RCT covariate distribution:
+        tau_OM = mean_X [ m1_hat(X) - m0_hat(X) ].
+    """
+    X = rct.loc[:, x_cols].to_numpy(float)
+    A = rct[treat_col].to_numpy(int)
+    Y = rct[outcome_col].to_numpy(float)
+
+    XF = build_poly2(X, interactions=True) if degree2 else X
+
+    # Model for controls: P(Y=1 | A=0, X)
+    X0 = XF[A == 0, :]
+    Y0 = Y[A == 0]
+    coef0, int0 = fit_logistic_l2(X0, Y0, l2=l2)
+    mu0_all = inv_logit(int0 + XF @ coef0)
+
+    # Model for treated: P(Y=1 | A=1, X)
+    X1 = XF[A == 1, :]
+    Y1 = Y[A == 1]
+    coef1, int1 = fit_logistic_l2(X1, Y1, l2=l2)
+    mu1_all = inv_logit(int1 + XF @ coef1)
+
+    tau_om = float(np.mean(mu1_all - mu0_all))
+    return tau_om
+
+
+# ======== OT-based RD with generic grid search for lambda ========
+
+def ot_lambda_grid_rd(rct,
+                      ec,
+                      target_tau: float,
+                      lambda_grid=None,
+                      rct_outcome_col: str = "Y_alt",
+                      ec_outcome_col: str = "Y",
+                      treat_col: str = "A",
+                      covariate_cols=("X1", "X2", "X3"),
+                      eps: float = 0.1,
+                      clip_ratio: float = 10.0):
+    """
+    OT-based RD estimator with lambda chosen by grid search
+    against a target tau.
+
+    The target_tau can be:
+      - tau_true from the simulator (oracle use, for Monte Carlo), or
+      - a plug-in tau_OM from an outcome model.
+
+    For each lambda in lambda_grid, we compute
+        tau_hat(lambda) = mu_T - [(1-lambda)*mu_C + lambda*mu_E],
+    then choose lambda_star that minimizes (tau_hat(lambda) - target_tau)^2.
+    """
+    if lambda_grid is None:
+        lambda_grid = np.linspace(0.0, 0.5, 51)
+
     Xr = rct.loc[:, covariate_cols].to_numpy(float)
     Xe = ec.loc[:, covariate_cols].to_numpy(float)
     Y_ec = ec[ec_outcome_col].to_numpy(float)
 
     # OT weights and EC mean
-    w = ot_weights_semi_relaxed(
-        Xe,
-        Xr,
-        eps=eps,
-        metric="mahalanobis",
-        augment=True,
-        clip_ratio=clip_ratio,
-        scale_cost=True,
-    )
+    w = ot_weights_semi_relaxed(Xe, Xr, eps=eps, clip_ratio=clip_ratio)
+    w = np.asarray(w, float)
     muE = float(np.sum(w * Y_ec))
 
+    # RCT treated/control means
     y_r = rct[rct_outcome_col].to_numpy(float)
     a = rct[treat_col].to_numpy(int)
     muT = float(y_r[a == 1].mean())
     muC = float(y_r[a == 0].mean())
 
-    lambda_star, mu0_model, losses = select_lambda_grid_om(
-        muC=muC,
-        muE=muE,
-        rct=rct,
-        x_cols=covariate_cols,
-        outcome_col=rct_outcome_col,
-        treat_col=treat_col,
-        lambda_grid=lambda_grid,
-        degree2=om_degree2,
-        l2=om_l2,
-    )
+    best_lambda = None
+    best_crit = None
+    best_tau = None
 
-    tau_hat = muT - ((1.0 - lambda_star) * muC + lambda_star * muE)
+    for lam in lambda_grid:
+        tau_lam = muT - ((1.0 - lam) * muC + lam * muE)
+        crit = (tau_lam - target_tau) ** 2
+        if best_crit is None or crit < best_crit:
+            best_crit = crit
+            best_lambda = lam
+            best_tau = tau_lam
 
-    # Balance diagnostics
-    diag = ot_balance_diagnostics(
-        rct,
-        ec,
-        w,
-        covariate_cols=covariate_cols,
-    )
-
+    diag = ot_balance_diagnostics(rct, ec, w, covariate_cols=covariate_cols)
     info = {
-        "lambda_star": float(lambda_star),
-        "mu0_model": float(mu0_model),
-        "muC": float(muC),
-        "muE": float(muE),
-        "lambda_grid": np.array(lambda_grid if lambda_grid is not None else []),
-        "loss_curve": losses,
+        "lambda_star": float(best_lambda),
+        "target_tau": float(target_tau),
+        "crit_value": float(best_crit),
         "max_SMD": diag["max_SMD"],
         "ESS": diag["ESS"],
     }
-    return tau_hat, info
+    return float(best_tau), info
+
+
+def ot_lambda_oracle_rd(rct,
+                        ec,
+                        tau_true: float,
+                        lambda_grid=None,
+                        rct_outcome_col: str = "Y_alt",
+                        ec_outcome_col: str = "Y",
+                        treat_col: str = "A",
+                        covariate_cols=("X1", "X2", "X3"),
+                        eps: float = 0.1,
+                        clip_ratio: float = 10.0):
+    """
+    Convenience wrapper for simulations where tau_true is known.
+
+    Simply calls ot_lambda_grid_rd with target_tau = tau_true.
+    """
+    if lambda_grid is None:
+        lambda_grid = np.linspace(0.0, 0.5, 51)
+
+    return ot_lambda_grid_rd(
+        rct=rct,
+        ec=ec,
+        target_tau=tau_true,
+        lambda_grid=lambda_grid,
+        rct_outcome_col=rct_outcome_col,
+        ec_outcome_col=ec_outcome_col,
+        treat_col=treat_col,
+        covariate_cols=covariate_cols,
+        eps=eps,
+        clip_ratio=clip_ratio,
+    )
+
 
 
 
